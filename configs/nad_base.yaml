@@ -1,0 +1,83 @@
+# 새 모델(NAD) 설정과 기본값. 노트북의 설정 칸이나 명령줄 --set key=value 가 이 값을 덮어쓴다.
+# 숫자는 모두 시작점으로 잡은 제안값이다(CLAUDE.md 3절).
+
+# ---------------- 위치 ----------------
+drive_root:                    # [필수] ASR_2026-2 폴더(안에 for_dataset/ 와 New_Architecture_dev/ 가 있다)
+local_root: /content/nad       # 코랩 로컬 디스크(원본 FOA, 오디오 캐시, 임시 예측). 세션이 끝나면 사라진다
+out_root:                      # 결과(runs/). 비우면 {drive_root}/New_Architecture_dev/runs
+cache_root:                    # 작은 캐시(CLAP, OWL-ViT, 라벨). 비우면 {drive_root}/New_Architecture_dev/cache
+
+# ---------------- 무엇을 돌릴까 ----------------
+preset: N1-pre                 # N1-pre | N1-otf | N2   (아래 PRESETS 참고, nad/config.py)
+seed: 1
+run_tag:                       # 실행 이름 뒤에 붙일 꼬리표(선택)
+
+# ---------------- 데이터 ----------------
+data_source:                   # prerender | onthefly  (비우면 프리셋 값)
+train_stages: "0,1"            # prerender 학습 데이터: 0 = main20 train(2999), 1 = S1(5912)
+flip_prob: 0.5                 # 좌우 반전 확률 (음향 L/R 교환, θ -> -θ, Δψ -> -Δψ). N2 에서는 반전 영상 캐시가 있는 클립만
+otf_include_no_video: false    # true 면 영상이 없는 녹음(room21 mix001~012)도 즉석 변환에 쓴다. 기본은 생성기와 같이 제외
+otf_clap_hop_s: 0.5            # 즉석 변환용 CLAP 을 녹음 단위로 몇 초 간격으로 뽑을지
+
+# ---------------- 학습 ----------------
+batch_size: 32
+total_steps: 20000             # 총 갱신 횟수 (N1-pre 와 N1-otf 는 같게 둔다)
+steps_per_epoch: 500           # 에폭 = 이 횟수만큼 갱신. 에폭마다 val 채점, last.pth 저장
+lr: 0.001
+weight_decay: 0.01
+warmup_steps: 1000
+grad_clip: 5.0
+num_workers: 6
+amp: true                      # bf16(가능하면) 또는 fp16 자동 혼합 정밀도
+select_metric:                 # F_ext | F_basic. 비우면 프리셋 값 (N1 = F_basic: 소리만으로는 앞/뒤를 알 수 없음, N2 = F_ext)
+feat_stats_batches: 40         # 특징 정규화 통계를 몇 배치로 구할지(학습 시작 때 1번)
+
+# ---------------- 손실 ----------------
+lambda_rot: 0.1                # Δψ MSE 가중치
+loss_fb:                       # 앞/뒤 손실 사용 (비우면 프리셋 값)
+loss_onscreen:                 # onscreen 손실 사용 (비우면 프리셋 값)
+loss_rot:                      # 회전 손실 사용 (비우면 프리셋 값)
+
+# ---------------- 모델 ----------------
+d_model: 256
+n_heads: 8
+spatial_layers: 4              # (A) Conformer 층 수
+temporal_layers: 4             # (E-2) Conformer 층 수
+conv_kernel: 15                # Conformer 깊이별 합성곱 커널(프레임 200 기준)
+dropout: 0.1
+rot_dim: 32                    # (D) 회전 특징 차원
+av_window: 2                   # (E-1) 음향 프레임 t 가 영상 t-k ~ t+k 만 본다
+
+# ---------------- 음향 특징 (NTU 와 같은 계산) ----------------
+sr: 24000
+n_fft: 1024
+hop: 300                       # 12.5ms, 20초 = 1601 프레임 -> 시간 풀링 8 -> 200
+n_mels: 64
+fmin: 50
+msc_lambda: 0.8
+div_lag_s: 1.0                 # ΔIV 간격(초)
+
+# ---------------- 2단계 (N2) ----------------
+init_from:                     # 1단계 실행 이름(runs/ 아래 폴더). (A),(B),CMC,(E-2),(F) 와 특징 통계를 가져온다
+freeze_spatial: true           # 처음에는 (A) 인코더를 고정
+finetune_after_step: 0         # 0 이면 끝까지 고정. 양수면 그 갱신 횟수부터 (A) 도 학습
+finetune_lr: 0.0001
+
+# ---------------- 사전학습 모델 (고정 가중치) ----------------
+clap_model: laion/clap-htsat-unfused       # LAION-CLAP (HuggingFace), 48kHz 입력
+clap_win_s: 2.0
+clap_hop_s: 0.5
+owl_model: google/owlvit-base-patch32      # OWL-ViT ViT-B/32 (HuggingFace)
+owl_prompts: configs/owl_prompts.yaml
+owl_pca_dim: 64
+owl_pca_clips: 300             # PCA 학습에 쓸 train 클립 수 (S0 train 에서)
+owl_pca_frames: 10             # 클립당 프레임 수
+owl_batch: 50                  # 한 번에 OWL-ViT 에 넣는 프레임 수
+
+# ---------------- 추론 후처리 (val 로 정한다) ----------------
+act_thresh: 0.5
+onscreen_tau: 0.5              # o > τ 면 앞(+)으로 고정
+snap_enable: true              # 검출 위치 보정 켜기/끄기 (N2 만)
+snap_score: 0.1                # 같은 클래스 열 점수(시그모이드) 기준
+snap_window_deg: 10.0          # 예측 θ 의 ±몇 도 안의 열만
+merge_deg: 20.0                # 같은 클래스 트랙 통합 기준

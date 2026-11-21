@@ -1,0 +1,16 @@
+# OWL-ViT 클래스 문장 (클래스 번호 순서, 13개). val 로 바꿔 가며 고른다.
+# 문장을 바꾸면 OWL-ViT 캐시를 다시 만들어야 한다(캐시 폴더 이름에 문장 해시가 들어간다).
+prompts:
+  - "a woman talking"            # 0 Female speech
+  - "a man talking"              # 1 Male speech
+  - "hands clapping"             # 2 Clapping
+  - "a telephone"                # 3 Telephone
+  - "a person laughing"          # 4 Laughter
+  - "a kitchen appliance"        # 5 Domestic sounds
+  - "a person walking"           # 6 Walk/footsteps
+  - "a door"                     # 7 Door open/close
+  - "a loudspeaker"              # 8 Music
+  - "a musical instrument"       # 9 Musical instrument
+  - "a water faucet"             # 10 Water tap
+  - "a bell"                     # 11 Bell
+  - "a hand knocking on a door"  # 12 Knock
