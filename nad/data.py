@@ -23,15 +23,17 @@ def dpsi_from_psi(psi):
     return np.concatenate([d[:1], d]).astype(np.float32)
 
 
-def events_to_adpit(ev, flip=False):
-    """ev: (n, 6) [frame, class, source, azimuth, distance(cm), onscreen] -> (200, 6, 5, 13) 텐서"""
+def events_to_adpit(ev, flip=False, on_soft=None):
+    """ev: (n, 6) [frame, class, source, azimuth, distance(cm), onscreen] -> (200, 6, 5, 13) 텐서
+    on_soft: (n,) 이면 onscreen 자리에 이 값(W1 소프트 라벨)을 넣는다. 좌우 반전에도 그대로다(시야가 좌우 대칭)."""
     import utils                                                   # 베이스라인 seld_challenge/utils.py
     d = {}
-    for fr, cl, src, az, dist, on in ev:
+    for i, (fr, cl, src, az, dist, on) in enumerate(ev):
         if fr >= CLIP_FRAMES:
             continue
         a = np.radians(-az if flip else az)
-        d.setdefault(int(fr), []).append([int(cl), int(src), float(np.cos(a)), float(np.sin(a)), float(dist), int(on)])
+        o = int(on) if on_soft is None else float(on_soft[i])
+        d.setdefault(int(fr), []).append([int(cl), int(src), float(np.cos(a)), float(np.sin(a)), float(dist), o])
     return utils.process_labels_adpit(d, CLIP_FRAMES, NB_CLASSES)
 
 
@@ -60,19 +62,23 @@ class PreTrainDataset(TrainBase):
     """미리 렌더링한 클립(main20 train S0, S1)을 무작위로(복원 추출) 뽑는다."""
     def __init__(self, cfg, length, keys, clap, video=None):
         super().__init__(cfg, length)
-        from .prerender import load_audio, load_meta
+        from .prerender import load_audio, load_meta, load_onsoft
         self.items = []                                             # (key, 인덱스, 이름)
-        self.audio, self.meta = {}, {}
+        self.audio, self.meta, self.onsoft = {}, {}, {}
+        use_soft = cfg.get('loss_version') == 'w1' and cfg['stage'] == 2 and cfg['loss_onscreen']
         for k in keys:
             names, arr = load_audio(cfg, k)
             self.audio[k] = arr
             self.meta[k] = load_meta(cfg, k)
+            if use_soft:
+                self.onsoft[k] = load_onsoft(cfg, k)                # W1 소프트 onscreen (prepare_pre 가 만든다)
             self.items += [(k, i, n) for i, n in enumerate(names)]
         self.clap = clap
         self.video = video                                          # VideoStore 또는 None
         if video is not None:
             self.items = [x for x in self.items if video.has(x[2])]
         self.flip_prob = float(cfg['flip_prob'])
+        self.video_drop = float(cfg['video_drop']) if (video is not None and cfg.get('loss_version') == 'w1') else 0.0
 
     def __getitem__(self, i):
         rng = self.rng(i)
@@ -86,9 +92,11 @@ class PreTrainDataset(TrainBase):
             audio = audio[::-1].copy()
         clap = self.clap.by_rec(m['recording'], m['start_frame'])
         d = dict(audio=torch.from_numpy(audio), clap=torch.from_numpy(clap), name=n,
-                 labels=events_to_adpit(m['ev'], flip), dpsi=torch.from_numpy(dpsi_from_psi(m['psi']) * (-1 if flip else 1)))
+                 labels=events_to_adpit(m['ev'], flip, self.onsoft[k][n] if k in self.onsoft else None), dpsi=torch.from_numpy(dpsi_from_psi(m['psi']) * (-1 if flip else 1)))
         if self.video is not None:
             d['video'] = self.video.get(n, flip)
+            if self.video_drop > 0:                                 # W1 영상 드롭아웃: 0 이면 이 샘플의 영상 특징 전체를 0
+                d['vkeep'] = torch.tensor(float(rng.random() >= self.video_drop))
         return d
 
 

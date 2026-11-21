@@ -122,10 +122,15 @@ class RecordingBank:
             self.labs.append(lab)
             self.lab_cum.append(np.concatenate([[0], np.cumsum(lf)]))
         w = np.array([r['audio_frames'] for r in self.recs], float)
+        if cfg.get('otf_room_balance', False):                   # 방별 같은 확률, 방 안에서는 길이 비례 (N1w-rb)
+            rooms = np.array([r['room'] for r in self.recs])
+            for rm in np.unique(rooms):
+                w[rooms == rm] /= w[rooms == rm].sum()
         self.weights = w / w.sum()
         self.index = {r['name']: i for i, r in enumerate(self.recs)}
         gb = sum(f.nbytes for f in self.foa) / 2 ** 30
-        log(f'[즉석 변환] 녹음 {len(self.recs)}개, 방 {sorted({r["room"] for r in self.recs})}, '
+        log(f'[즉석 변환] 녹음 선택 {"방 균형" if cfg.get("otf_room_balance", False) else "길이 비례"}, '
+            f'녹음 {len(self.recs)}개, 방 {sorted({r["room"] for r in self.recs})}, '
             f'{sum(r["audio_frames"] for r in self.recs) / 36000:.2f}시간, FOA 메모리 {gb:.2f}GB')
 
     def foa_window(self, i, start, n=CLIP_FRAMES):

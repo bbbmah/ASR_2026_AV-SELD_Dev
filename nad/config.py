@@ -14,12 +14,19 @@ NAD_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BASE_YAML = os.path.join(NAD_DIR, 'configs', 'nad_base.yaml')
 
 # 프리셋: 개별 옵션이 비어 있을 때 쓰는 값
+_W1 = dict(loss_version='w1', ema_decay=0.999, grad_clip=1.0)      # MODEL_DEV_2.md W1 설정
 PRESETS = {
     'N1-pre': dict(stage=1, data_source='prerender', loss_fb=False, loss_onscreen=False, loss_rot=False, select_metric='F_basic'),
     'N1-otf': dict(stage=1, data_source='onthefly', loss_fb=False, loss_onscreen=False, loss_rot=False, select_metric='F_basic'),
     'N2':     dict(stage=2, data_source='prerender', loss_fb=True, loss_onscreen=True, loss_rot=True, select_metric='F_ext'),
+    # W1 (MODEL_DEV_2.md): 새 손실(접은 각도 α, 스무딩, 소프트 onscreen, 정규화), EMA, 클리핑 1.0, 2단계 영상 드롭아웃
+    'N1w':    dict(stage=1, data_source='onthefly', loss_fb=False, loss_onscreen=False, loss_rot=False, select_metric='F_basic', **_W1),
+    'N1w-rb': dict(stage=1, data_source='onthefly', loss_fb=False, loss_onscreen=False, loss_rot=False, select_metric='F_basic',
+                   otf_room_balance=True, **_W1),
+    'N2w':    dict(stage=2, data_source='prerender', loss_fb=True, loss_onscreen=True, loss_rot=True, select_metric='F_ext', **_W1),
 }
 PRESET_KEYS = ('data_source', 'loss_fb', 'loss_onscreen', 'loss_rot', 'select_metric')
+FORCED_KEYS = ('loss_version', 'ema_decay', 'grad_clip', 'otf_room_balance')    # 프리셋에 있으면 --set 으로 주지 않은 한 프리셋 값
 
 CLIP_FRAMES = 200
 NB_CLASSES = 13
@@ -62,6 +69,11 @@ def load_config(preset=None, sets=None, base_yaml=BASE_YAML):
     for k in PRESET_KEYS:
         if _blank(cfg.get(k)):
             cfg[k] = pv[k]
+    for k in FORCED_KEYS:
+        if k in pv and k not in over:
+            cfg[k] = pv[k]
+    if cfg['loss_version'] not in ('v0', 'w1'):
+        raise ValueError("loss_version 은 v0 | w1")
     for k in ('loss_fb', 'loss_onscreen', 'loss_rot'):
         cfg[k] = bool(cfg[k])
     if cfg['data_source'] not in ('prerender', 'onthefly'):

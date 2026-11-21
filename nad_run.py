@@ -10,6 +10,7 @@ nad_run.py -- 새 모델(NAD)의 모든 단계를 이 파일 하나로 돌린다
   prepare_pre   미리 렌더링한 데이터의 오디오 캐시(로컬)와 라벨 캐시(드라이브), val 정답 풀기
   check_feat    GPU 음향 특징이 NTU numpy 특징과 같은지 (val 클립 1개)
   oracle        정답 -> 새 출력 형식 -> 후처리 -> csv -> 베이스라인 채점이 정상인지
+  w1_check      [W1, --preset N2w] 소프트 onscreen 캐시 + 일치율, θ 복원, α 형식 오라클, 정답 입력 손실 (MODEL_DEV_2.md 확인 2, 3)
   clap          CLAP 캐시 (train 녹음 단위 + val/test 클립 단위)
   owl_size      OWL-ViT 캐시 예상 용량 (만들기 전에 먼저 본다)
   owl_check     OWL-ViT 전처리 설정 확인 (정사각형 늘리기/여백, 열 방위각)
@@ -60,6 +61,9 @@ def main(argv=None):
     elif s == 'oracle':
         from nad.runner import oracle_check
         oracle_check(cfg)
+    elif s == 'w1_check':
+        from nad.w1check import run
+        run(cfg)
     elif s == 'clap':
         from nad.semantic import build_rec_train, build_clips
         build_rec_train(cfg, dev)

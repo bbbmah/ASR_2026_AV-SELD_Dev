@@ -12,6 +12,7 @@ L = Σ_class min_ADPIT순열 Σ_트랙 [ BCE(a, â) + a · ( (sinθ - ŝ)² + |c
  - 프리셋에 따라 앞/뒤(fb), onscreen, 회전 항을 끈다(1단계: 활성, sinθ, 거리만).
 정답 텐서는 베이스라인 utils.process_labels_adpit 의 출력 (B, T, 6, 5[act, x=cosθ, y=sinθ, dist(m), onscreen], 13).
 """
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -43,8 +44,9 @@ class NADLoss(nn.Module):
         self.fb, self.on, self.rot = cfg['loss_fb'], cfg['loss_onscreen'], cfg['loss_rot']
         self.lam = cfg['lambda_rot']
 
-    def forward(self, pred, target, dpsi=None):
-        """pred: dict(out=(B,T,3,5,13), dpsi=(B,T)|None), target: (B,T,6,5,13), dpsi: (B,T) 도/프레임 정답.
+    def forward(self, pred, target, dpsi=None, vkeep=None, step=None):
+        """(vkeep, step 은 W1 손실과 호출 형태를 맞추려고 받기만 한다)
+        pred: dict(out=(B,T,3,5,13), dpsi=(B,T)|None), target: (B,T,6,5,13), dpsi: (B,T) 도/프레임 정답.
         반환: (전체 손실, 항목별 값 dict)"""
         out = pred['out'].float()
         act = perm_targets(target[:, :, :, 0])                     # (P, B, T, 3, C)
@@ -92,3 +94,95 @@ class NADLoss(nn.Module):
             parts['rot'] = float(l_rot.detach())
         parts['total'] = float(loss.detach())
         return loss, parts
+
+
+class W1Loss(nn.Module):
+    """MODEL_DEV_2.md W1 손실.
+    L = Σ_{t,c} min_π Σ_k [ w_a·ℓ_a + a·( w_s·ℓ_s + w_f·ℓ_f + w_d·ℓ_d + w_o·ℓ_o ) ] + w_ψ·ℓ_Δψ
+      ① ℓ_a = BCE(a, â)                         전체 칸(배치, 프레임, 트랙, 클래스) 평균
+      ② ℓ_s = Huber(δ=1)(α̂/20° 출력 - α/20°)     α = arcsin(sinθ) (접은 방위각). 출력 자리는 기존 sinθ 자리, 선형
+      ③ ℓ_f = |cosθ|·BCE(f_ε, f̂), f_ε = 1-ε/2 (앞) | ε/2 (뒤)
+      ④ ℓ_d = |ln d - ℓ̂| / ln2
+      ⑤ ℓ_o = BCE(o_τ, ô)  (o_τ = 소프트 onscreen 라벨, 라벨 텐서의 onscreen 자리)
+      ⑥ ℓ_Δψ = ((Δψ - Δψ̂)/1.8°)², 프레임 평균
+    ②~⑤ 는 고른 순열 기준 a=1 칸의 수로 나눈다(0개면 0). ③⑤⑥ 은 영상 드롭 샘플(vkeep=0)을 빼고 계산하고 분모에서도 뺀다.
+    순열은 위 가중 합(칸별, 트랙 합)으로 고른다(기존과 같은 방식)."""
+    def __init__(self, cfg):
+        super().__init__()
+        self.fb, self.on, self.rot = cfg['loss_fb'], cfg['loss_onscreen'], cfg['loss_rot']
+        self.c = {k: float(cfg[k]) for k in ('w_act', 'w_alpha', 'alpha_scale_deg', 'w_fb', 'fb_smooth', 'w_dist',
+                                             'w_on_start', 'w_on_end', 'w_on_ramp_steps', 'w_psi', 'psi_scale_deg')}
+        self.last_terms = None                      # 가중치를 곱한 항별 손실 텐서 (그래디언트 노름 기록용)
+
+    def w_on(self, step):
+        c = self.c
+        if step is None or c['w_on_ramp_steps'] <= 0:
+            return c['w_on_end']
+        return c['w_on_start'] + (c['w_on_end'] - c['w_on_start']) * min(1.0, step / c['w_on_ramp_steps'])
+
+    def forward(self, pred, target, dpsi=None, vkeep=None, step=None):
+        c = self.c
+        out = pred['out'].float()
+        B = out.shape[0]
+        keep = torch.ones(B, device=out.device) if vkeep is None else vkeep.float().to(out.device)
+        act = perm_targets(target[:, :, :, 0])                     # (P, B, T, 3, C)
+        cos = perm_targets(target[:, :, :, 1])
+        sin = perm_targets(target[:, :, :, 2])
+        dist = perm_targets(target[:, :, :, 3])
+        ons = perm_targets(target[:, :, :, 4])
+        alpha = torch.rad2deg(torch.asin(sin.clamp(-1.0, 1.0))) / c['alpha_scale_deg']
+        logd = torch.log(dist.clamp(min=0.05))
+
+        a_l = out[:, :, :, E_ACT][None]
+        s_p = out[:, :, :, E_SIN][None]                            # α̂/20° (선형)
+        f_l = out[:, :, :, E_FB][None]
+        d_p = out[:, :, :, E_DIST][None]
+        o_l = out[:, :, :, E_ON][None]
+        km = keep[None, :, None, None, None]
+
+        l_a = F.binary_cross_entropy_with_logits(a_l.expand_as(act), act, reduction='none')
+        l_s = F.huber_loss(s_p.expand_as(alpha), alpha, reduction='none', delta=1.0)
+        l_d = (logd - d_p).abs() / math.log(2.0)
+        w_o = self.w_on(step)
+        per = c['w_act'] * l_a + act * (c['w_alpha'] * l_s + c['w_dist'] * l_d)
+        l_f = l_o = None
+        if self.fb:
+            eps = c['fb_smooth']
+            tgt = torch.where(cos > 0, torch.full_like(cos, 1 - eps / 2), torch.full_like(cos, eps / 2))
+            l_f = cos.abs() * F.binary_cross_entropy_with_logits(f_l.expand_as(cos), tgt, reduction='none')
+            per = per + act * km * c['w_fb'] * l_f
+        if self.on:
+            l_o = F.binary_cross_entropy_with_logits(o_l.expand_as(ons), ons, reduction='none')
+            per = per + act * km * w_o * l_o
+        best = per.sum(dim=3).argmin(dim=0)                        # (B, T, C) 순열 선택
+
+        def pick(x):
+            idx = best[None, :, :, None, :].expand(1, *x.shape[1:])
+            return torch.gather(x, 0, idx).squeeze(0)
+        a_s = pick(act)
+        a_k = a_s * keep[:, None, None, None]
+        n_a, n_k = a_s.sum().clamp(min=1), a_k.sum().clamp(min=1)
+        terms = dict(act=c['w_act'] * pick(l_a).mean(),
+                     alpha=c['w_alpha'] * (pick(l_s) * a_s).sum() / n_a,
+                     dist=c['w_dist'] * (pick(l_d) * a_s).sum() / n_a)
+        raw = dict(act=terms['act'] / c['w_act'], alpha=terms['alpha'] / c['w_alpha'], dist=terms['dist'] / c['w_dist'])
+        if l_f is not None:
+            raw['fb'] = (pick(l_f) * a_k).sum() / n_k
+            terms['fb'] = c['w_fb'] * raw['fb']
+        if l_o is not None:
+            raw['on'] = (pick(l_o) * a_k).sum() / n_k
+            terms['on'] = w_o * raw['on']
+        if self.rot and pred.get('dpsi') is not None and dpsi is not None:
+            e = (((dpsi.float() - pred['dpsi'].float()) / c['psi_scale_deg']) ** 2).mean(dim=1)     # (B,)
+            raw['rot'] = (e * keep).sum() / keep.sum().clamp(min=1)
+            terms['rot'] = c['w_psi'] * raw['rot']
+        loss = sum(terms.values())
+        self.last_terms = terms
+        parts = {k: float(v.detach()) for k, v in raw.items()}     # 가중치 곱하기 전 값
+        parts['w_on'] = w_o
+        parts['total'] = float(loss.detach())
+        return loss, parts
+
+
+def make_loss(cfg):
+    return W1Loss(cfg) if cfg.get('loss_version', 'v0') == 'w1' else NADLoss(cfg)

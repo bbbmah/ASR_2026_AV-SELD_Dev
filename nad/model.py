@@ -8,6 +8,7 @@ model.py -- 제안 모델 (CLAUDE.md 3.1, 3.2)
 (E-1) 국소 교차 어텐션: 음향 t -> 영상 t-2..t+2 열 토큰 (120개), 잔차 ─────────────────────────┘
 (E-2) [AV 256 ; 회전 32] -> 256 + 위치 인코딩 -> Conformer(4층)
 (F) 트랙3 × [활성, sinθ, 앞/뒤, log 거리, onscreen] × 클래스13 = 195 (활성 함수 전 값)
+    W1(loss_version=w1)에서는 sinθ 자리가 접은 방위각 α/20° (선형, 가두지 않음)이다. 모델 구조는 같고 해석만 다르다.
 
 1단계(audio): 영상 입력이 없으면 (C),(D),(E-1)을 건너뛰고 회전 특징은 0 이다. 2단계는 1단계 가중치를 그대로 이어받는다.
 """
@@ -136,10 +137,13 @@ class VisualTokens(nn.Module):
     def standardize(self, v):
         return (v.float() - self.vis_mean) / self.vis_std
 
+    def tokens(self, z):
+        pos = torch.stack([torch.sin(self.col_az), torch.cos(self.col_az)], -1)       # (24, 2)
+        return self.ln(self.proj(z) + self.az(pos))
+
     def forward(self, v):
         z = self.standardize(v)
-        pos = torch.stack([torch.sin(self.col_az), torch.cos(self.col_az)], -1)       # (24, 2)
-        return self.ln(self.proj(z) + self.az(pos)), z
+        return self.tokens(z), z
 
 
 class RotationHead(nn.Module):
@@ -203,6 +207,10 @@ class NADModel(nn.Module):
         self.t_drop = nn.Dropout(dr)
         self.temporal = nn.ModuleList([ConformerBlock(d, h, k, dr) for _ in range(cfg['temporal_layers'])])
         self.head = nn.Linear(d, TRACKS * N_ELEM * NB_CLASSES)
+        # W1 영상 정규화 (2단계 학습 때만): 열 드롭아웃, (D) 입력 노이즈
+        w1v = cfg.get('loss_version', 'v0') == 'w1' and cfg.get('stage') == 2
+        self.col_drop = float(cfg.get('col_drop', 0.0)) if w1v else 0.0
+        self.d_noise = float(cfg.get('d_noise', 0.0)) if w1v else 0.0
 
     def acoustic(self, stereo, clap):
         x = self.feat(stereo)                                                  # (B, 7, 1601, 64) 정규화됨
@@ -210,15 +218,25 @@ class NADModel(nn.Module):
         se = self.sem_pe(self.sem_proj(clap.float()))                          # (B, 200, d)
         return self.cmc(sp, se)
 
-    def forward(self, stereo, clap, video=None):
+    def forward(self, stereo, clap, video=None, vkeep=None):
         """stereo (B,2,N), clap (B,200,512), video (B,200,24,77) 또는 None.
+        vkeep: (B,) 0/1. 0 인 샘플은 표준화한 영상 특징 전체를 0 으로 둔다(W1 영상 드롭아웃, D 입력 포함).
         반환: dict(out=(B,T,3,5,13) 활성 함수 전 값, dpsi=(B,T) 또는 None)"""
         a = self.acoustic(stereo, clap)
         B, T, _ = a.shape
         dpsi = None
         if video is not None:
-            vt, z = self.vis(video)
-            dpsi, rf = self.rot(z)
+            z = self.vis.standardize(video)                                    # (B, T, 24, 77)
+            if vkeep is not None:
+                z = z * vkeep.to(z.dtype)[:, None, None, None]
+            if self.training and self.col_drop > 0:
+                z = z * (torch.rand(B, z.shape[1], z.shape[2], 1, device=z.device) >= self.col_drop).to(z.dtype)
+            vt = self.vis.tokens(z)
+            zr = z
+            if self.training and self.d_noise > 0:                             # 표준화 특징의 표준편차는 1 이므로 노이즈 σ = d_noise
+                n = torch.randn_like(z) * self.d_noise
+                zr = z + (n if vkeep is None else n * vkeep.to(z.dtype)[:, None, None, None])
+            dpsi, rf = self.rot(zr)
             a = self.lca(a, vt)
         else:
             rf = a.new_zeros(B, T, self.rot_dim)

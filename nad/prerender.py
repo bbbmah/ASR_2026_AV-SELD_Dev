@@ -181,6 +181,59 @@ def load_meta(cfg, key):
     return pickle.load(open(meta_path(cfg, key), 'rb'))
 
 
+# ====================================================================== W1 소프트 onscreen 라벨
+def soft_onscreen(G, az_w, el_w, yaw, pitch, tau):
+    """생성기 onscreen 판정(dsgen.onscreen: x>0, |y|≤x·tanH, |z|≤x·tanV)과 같은 경계에서 잰 부드러운 라벨.
+    카메라 좌표는 생성기 dsgen.to_cam 으로 구한다. 가로/세로 투영각 h=atan2(|y|,x), v=atan2(|z|,x) (도)로
+    o_τ = σ((FOV_H/2 - h)/τ) · σ((atan(TAN_V) - v)/τ) · 1[x>0]."""
+    import math
+    c = G.to_cam(np.asarray(az_w, float), np.asarray(el_w, float), np.asarray(yaw, float), np.asarray(pitch, float))
+    x, y, z = c[..., 0], c[..., 1], c[..., 2]
+    h = np.degrees(np.arctan2(np.abs(y), x))
+    v = np.degrees(np.arctan2(np.abs(z), np.maximum(x, 1e-9)))
+    sig = lambda u: 1.0 / (1.0 + np.exp(-u))
+    return (sig((G.FOV_H / 2 - h) / tau) * sig((math.degrees(math.atan(G.TAN_V)) - v) / tau) * (x > 0)).astype(np.float32)
+
+
+def onsoft_path(cfg, key):
+    return os.path.join(cfg['cache_root'], 'meta', f'{key}_onsoft_tau{float(cfg["on_soft_tau"]):g}.pkl')
+
+
+def build_onsoft(cfg, key, log=print):
+    """train 클립의 meta/{clip}_ext.csv(세계 방위각·고도, 카메라 yaw·pitch)로 소프트 onscreen 라벨을 만든다.
+    {clip: (행 수,) float32} 이고 행 순서는 라벨 캐시의 사건 배열(ev)과 같다(확인함). 이진화(>0.5) 일치율을 로그에 남긴다."""
+    from .config import import_dsgen
+    path = onsoft_path(cfg, key)
+    if os.path.exists(path):
+        log(f'[건너뜀] 소프트 onscreen 캐시 있음: {path}')
+        return
+    G = import_dsgen(cfg, os.path.join(cfg['local_root'], 'raw'))
+    meta = load_meta(cfg, key)
+    mem = list_members(cfg, key)
+    zips = {}
+    for n, (z, d) in mem.items():
+        zips.setdefault(z, []).append(n)
+    out, agree, tot = {}, 0, 0
+    for z, ns in zips.items():
+        with zipfile.ZipFile(z) as zf:
+            for n in ns:
+                ext_m = mem[n][1]['labels'].replace('/labels/', '/meta/').replace('.csv', '_ext.csv')
+                e = pd.read_csv(io.BytesIO(zf.read(ext_m)))
+                ev = meta[n]['ev']
+                if len(e) != len(ev) or not (e[['frame', 'class', 'source', 'azimuth', 'distance', 'onscreen']].values == ev).all():
+                    raise RuntimeError(f'{n}: ext csv 행이 라벨과 다릅니다')
+                s = soft_onscreen(G, e.az_world.values, e.el_world.values, e.cam_yaw.values, e.cam_pitch.values, float(cfg['on_soft_tau']))
+                agree += int(((s > 0.5).astype(int) == ev[:, 5]).sum()); tot += len(ev)
+                out[n] = s
+    tmp = path + '.tmp'
+    pickle.dump(out, open(tmp, 'wb')); os.replace(tmp, path)
+    log(f'  {key}: 소프트 onscreen {len(out)}클립 -> {path}  (0.5 이진화 = 하드 라벨 {100 * agree / max(1, tot):.3f}%, {tot}행)')
+
+
+def load_onsoft(cfg, key):
+    return pickle.load(open(onsoft_path(cfg, key), 'rb'))
+
+
 def extract_labels(cfg, split, log=print):
     """채점용 정답 csv 를 로컬에 푼다. split = val (val.zip) | test (private_test.zip, 최종 보고용)."""
     p = fd_paths(cfg)
@@ -204,5 +257,7 @@ def prepare_pre(cfg, keys, log=print):
     size_report(cfg, keys, log)
     for k in keys:
         build_meta(cfg, k, log)
+        if cfg.get('loss_version') == 'w1' and cfg['stage'] == 2 and k.startswith('train'):
+            build_onsoft(cfg, k, log)
         build_audio(cfg, k, log)
     extract_labels(cfg, 'val', log)

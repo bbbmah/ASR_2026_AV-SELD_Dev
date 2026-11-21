@@ -37,12 +37,15 @@ FB_BASELINE = 2 / 3          # 이보다 낮으면 앞/뒤를 둘 다 내는 쪽
 EPS = np.finfo(float).eps
 
 
+DIAG_ID = 'DIAG_01'          # diag_run.py --diag 로 바꾼다 (W1 진단은 다른 폴더에 써서 기존 결과를 덮지 않는다)
+
+
 def out_dir(cfg):
-    return os.path.join(cfg['nad_dir'], 'diag', 'DIAG_01')
+    return os.path.join(cfg['nad_dir'], 'diag', DIAG_ID)
 
 
 def tmp_dir(cfg, *a):
-    return os.path.join(cfg['local_root'], 'tmp', 'diag01', *a)
+    return os.path.join(cfg['local_root'], 'tmp', DIAG_ID.lower().replace('_', ''), *a)
 
 
 def _sig(x):
@@ -213,7 +216,7 @@ def onscreen_stats(cfg, pred_dir, ref_dir, osa_now):
 
 
 # ====================================================================== 1~4번 (N2)
-def run_n2(cfg, log):
+def run_n2(cfg, log, combo=None):
     from .prerender import extract_labels
     path = os.path.join(out_dir(cfg), 'n2.json')
     if os.path.exists(path):
@@ -246,7 +249,7 @@ def run_n2(cfg, log):
             res['item1'][s][k] = e
             log(f'[1] {s} 조합 {k}: {e}')
     pick = lambda s: max(COMBOS, key=lambda k: -1 if res['item1'][s][k]['F_ext'] is None else res['item1'][s][k]['F_ext'])
-    chosen = pick('val')
+    chosen = combo or pick('val')                      # combo 를 주면 그 조합으로 고정 (W1: 기존 postproc.json = 조합 a)
     res['chosen_val'], res['best_test'] = chosen, (pick('test') if 'test' in res['item1'] else None)
     pp_c = dict(base_pp, snap_enable=COMBOS[chosen][0], onscreen_front=COMBOS[chosen][1])
     res['meta']['postproc_chosen'] = pp_c
@@ -310,15 +313,18 @@ def boot_metrics(S):
     return out
 
 
-def run_n1(cfg_pre, cfg_otf, log):
+def run_n1(cfg_pre, cfg_otf, log, out='n1'):
+    """두 run 의 기존 예측 csv 비교. 키 이름은 기존 json 과 맞춰 pre(=A), otf(=B) 를 쓰고, 실제 프리셋은 meta.labels 에 둔다.
+    W1: A=N1-otf, B=N1w (n1.json), A=N2, B=N2w (out='n1_N2' -> n1_N2.json)."""
     from .prerender import extract_labels
-    path = os.path.join(out_dir(cfg_otf), 'n1.json')
+    path = os.path.join(out_dir(cfg_otf), f'{out}.json')
     if os.path.exists(path):
         log(f'[건너뜀] {path} (다시 하려면 지우세요)')
         return
     add_seld_path(cfg_otf)
     t0 = time.time()
-    res = dict(meta=dict(pre=cfg_pre['run_name'], otf=cfg_otf['run_name'], seed=cfg_otf['seed'], B=BOOT_B, boot_seed=BOOT_SEED,
+    res = dict(meta=dict(pre=cfg_pre['run_name'], otf=cfg_otf['run_name'], labels=dict(pre=cfg_pre['preset'], otf=cfg_otf['preset']),
+                         seed=cfg_otf['seed'], B=BOOT_B, boot_seed=BOOT_SEED,
                          postproc=dict(pre=R.postproc_params(cfg_pre), otf=R.postproc_params(cfg_otf))),
                item3={}, item5={})
     for s in SPLITS:
@@ -373,14 +379,18 @@ def write_tables(cfg, log=print):
     od = out_dir(cfg)
     n2 = json.load(open(os.path.join(od, 'n2.json'), encoding='utf8')) if os.path.exists(os.path.join(od, 'n2.json')) else None
     n1 = json.load(open(os.path.join(od, 'n1.json'), encoding='utf8')) if os.path.exists(os.path.join(od, 'n1.json')) else None
-    L = ['# DIAG_01 결과 표 (자동 생성)', '']
+    pairs = [json.load(open(os.path.join(od, f), encoding='utf8')) for f in sorted(os.listdir(od)) if f.startswith('n1') and f.endswith('.json')] if os.path.isdir(od) else []
+    N = cfg['preset']                                                    # 진단한 2단계 프리셋 (N2 또는 N2w)
+    lab = lambda j, k, d: j['meta'].get('labels', {}).get(k, d)          # DIAG_01 json 에는 labels 가 없다
+    A1 = lab(n1, 'otf', 'N1-otf') if n1 else 'N1-otf'
+    L = [f'# {DIAG_ID} 결과 표 (자동 생성)', '']
     if n2:
         m = n2['meta']; ppj = m['postproc_json']
-        L += [f"- N2 체크포인트: `{m['run']}/best_model.pth` (에폭 {m['best_epoch']}), 시드 {m['seed']}",
+        L += [f"- {N} 체크포인트: `{m['run']}/best_model.pth` (에폭 {m['best_epoch']}), 시드 {m['seed']}",
               f"- 후처리 기본값(postproc.json): τ={ppj['onscreen_tau']}, 열 점수 기준={ppj['snap_score']}, 창 ±{ppj['snap_window_deg']}°, "
               f"활성 {ppj['act_thresh']}, 통합 {ppj['merge_deg']}° (postproc.json 의 보정 켜기={ppj['snap_enable']})",
               f"- val F_ext 최고 조합: **{n2['chosen_val']}**, test F_ext 최고 조합: {n2['best_test']}", '',
-              '## 1. N2 후처리 4조합', '']
+              f'## 1. {N} 후처리 4조합', '']
         for s in SPLITS:
             L += [f'**{s}**', '', '| 조합 | 위치 보정 | on→앞 | F_ext | F_basic | DOAE_ext | RDE | OSA | 보정이 바꾼 비율 | 바뀐 것 중 가까워짐 (정답 있는 것 중) |',
                   '|---|---|---|---|---|---|---|---|---|---|']
@@ -391,7 +401,7 @@ def write_tables(cfg, log=print):
                 L.append(f"| {k} | {'켬' if sn else '끔'} | {'켬' if fr else '끔'} | {_p(e['F_ext'])} | {_p(e['F_basic'])} | {_n(e['DOAE_ext'])} | "
                          f"{_n(e['RDE'], 4)} | {_p(e['OSA'])} | {sc} | {cl} |")
             L.append('')
-        L += [f"## 2. N2 영상 원래 / 0 / 섞기 (후처리 조합 {n2['chosen_val']})", '',
+        L += [f"## 2. {N} 영상 원래 / 0 / 섞기 (후처리 조합 {n2['chosen_val']})", '',
               '| split | 영상 | F_ext | F_basic | DOAE_ext | RDE | OSA |', '|---|---|---|---|---|---|---|']
         for s in SPLITS:
             for mode, nm in (('real', '원래'), ('zeros', '0'), ('shuffle', '섞기')):
@@ -400,9 +410,9 @@ def write_tables(cfg, log=print):
         L.append('')
     if n1 or n2:
       L += ['## 3. 앞/뒤 정확도 (접은 방위각 매칭 쌍; 괄호 = 접은 오차 ≤20° 쌍)', '',
-            f'기준선: {FB_BASELINE:.3f} (이보다 낮으면 앞/뒤 둘 다 내는 쪽이 점수상 유리). N1-otf 는 앞/뒤를 학습하지 않아 항상 앞으로 낸다.', '']
+            f'기준선: {FB_BASELINE:.3f} (이보다 낮으면 앞/뒤 둘 다 내는 쪽이 점수상 유리). {A1} 는 앞/뒤를 학습하지 않아 항상 앞으로 낸다.', '']
       for s in SPLITS:
-        L += [f'**{s}**', '', '| 그룹 | N1-otf 정확도 | N2 정확도 | 쌍 수 (N2) | 정답 앞 비율 (N2 쌍) |', '|---|---|---|---|---|']
+        L += [f'**{s}**', '', f'| 그룹 | {A1} 정확도 | {N} 정확도 | 쌍 수 ({N}) | 정답 앞 비율 ({N} 쌍) |', '|---|---|---|---|---|']
         a = n1['item3'][s]['rows'] if n1 else None
         b = n2['item3'][s]['rows'] if n2 else None
         for i in range(len((a or b))):
@@ -411,12 +421,12 @@ def write_tables(cfg, log=print):
             L.append(f"| {(ra or rb)['group']} | {f(ra)} | {f(rb)} | {rb['n'] if rb else '–'} ({rb['n_near'] if rb else '–'}) | {_p(rb['gt_front'], 1) if rb else '–'} |")
         L.append('')
     if n2:
-        L += ['N2 앞/뒤 확률 f 분포 (활성 칸, 10구간 개수)', '', '| split | 0.0 | 0.1 | 0.2 | 0.3 | 0.4 | 0.5 | 0.6 | 0.7 | 0.8 | 0.9 | 0.4~0.6 비율 |',
+        L += [f'{N} 앞/뒤 확률 f 분포 (활성 칸, 10구간 개수)', '', '| split | 0.0 | 0.1 | 0.2 | 0.3 | 0.4 | 0.5 | 0.6 | 0.7 | 0.8 | 0.9 | 0.4~0.6 비율 |',
               '|---|' + '---|' * 11]
         for s in SPLITS:
             h = n2['fhist'][s]
             L.append(f"| {s} | " + ' | '.join(str(c) for c in h['counts']) + f" | {_p(h['frac_04_06'], 1)}% |")
-        L += ['', f"## 4. N2 onscreen 헤드 (조합 {n2['chosen_val']}; 정밀도/재현율은 ext 매칭 쌍 기준)", '',
+        L += ['', f"## 4. {N} onscreen 헤드 (조합 {n2['chosen_val']}; 정밀도/재현율은 ext 매칭 쌍 기준)", '',
               '| split | 정답 on 비율 (전체 행) | 예측 on 비율 (전체 행) | 정밀도 | 재현율 | F1 | OSA | 전부 0일 때 OSA |', '|---|---|---|---|---|---|---|---|']
         for s in SPLITS:
             e = n2['item4'][s]
@@ -426,12 +436,13 @@ def write_tables(cfg, log=print):
         for s in SPLITS:
             L.append(f"| {s} | " + ' | '.join(str(c) for c in n2['ohist'][s]['counts']) + ' |')
         L.append('')
-    if n1:
-        L += [f"## 5. N1-pre vs N1-otf 부트스트랩 (클립 단위 {n1['meta']['B']}번, 시드 {n1['meta']['boot_seed']})", '',
-              f"`{n1['meta']['pre']}` vs `{n1['meta']['otf']}`, 기존 예측 csv (runs/*/pred_val, pred_test)", '',
-              '| split | 지표 | pre | otf | otf − pre | 95% 구간 | otf>pre 비율 |', '|---|---|---|---|---|---|---|']
+    for k5, P in enumerate(pairs):
+        a5, b5 = lab(P, 'pre', 'N1-pre'), lab(P, 'otf', 'N1-otf')
+        L += [f"## 5{'-' + str(k5 + 1) if len(pairs) > 1 else ''}. {a5} vs {b5} 부트스트랩 (클립 단위 {P['meta']['B']}번, 시드 {P['meta']['boot_seed']})", '',
+              f"`{P['meta']['pre']}` vs `{P['meta']['otf']}`, 기존 예측 csv (runs/*/pred_val, pred_test, best 체크포인트)", '',
+              f'| split | 지표 | {a5} | {b5} | {b5} − {a5} | 95% 구간 | {b5}>{a5} 비율 |', '|---|---|---|---|---|---|---|']
         for s in SPLITS:
-            e = n1['item5'][s]
+            e = P['item5'][s]
             for m in ('F_ext', 'F_basic'):
                 x = e[m]
                 L.append(f"| {s} | {m} | {_p(x['pre'])} | {_p(x['otf'])} | {_p(x['diff'])} | [{_p(x['ci95'][0])}, {_p(x['ci95'][1])}] | {_p(x['frac_gt0'], 1)}% |")

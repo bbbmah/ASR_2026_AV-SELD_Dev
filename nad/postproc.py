@@ -2,6 +2,7 @@
 postproc.py -- 추론 후처리 (CLAUDE.md 3.4)
 
 1. 활성 a > 0.5 인 칸만. θ = atan2(s, ±√(1-s²)), f ≥ 0.5 면 +(앞), 아니면 -(뒤).
+   W1(pp['az_param']='alpha'): α = 출력×20° 를 ±90° 로 자르고, 앞이면 θ=α, 뒤면 θ=sign(α)(180°-|α|).
    (앞/뒤 손실을 끈 1단계 모델은 f 를 학습하지 않았으므로 항상 앞(+)으로 둔다: fb_trained=False)
 2. o > τ 면 앞(+)으로 고정.
 3. 검출 위치 보정(켜고 끄기): o > τ 이고, 같은 클래스의 OWL-ViT 열 점수(시그모이드)가 기준 이상인 열이 예측 θ 의 ±창 안에 있으면
@@ -23,6 +24,18 @@ def circ_diff(a, b):
     return np.abs((a - b + 180.0) % 360.0 - 180.0)
 
 
+def alpha_from_theta(th_deg):
+    """접은 방위각 α = arcsin(sinθ) (도). |θ|≤90° 면 α=θ, 아니면 sign(θ)(180°-|θ|)."""
+    return np.degrees(np.arcsin(np.clip(np.sin(np.radians(th_deg)), -1.0, 1.0)))
+
+
+def theta_from_alpha(al_deg, front):
+    """α 를 ±90° 로 자르고, 앞이면 θ=α, 뒤면 θ=sign(α)(180°-|α|) (α=0 이고 뒤면 180°)."""
+    al = np.clip(al_deg, -90.0, 90.0)
+    sg = np.where(al >= 0, 1.0, -1.0)
+    return np.where(front, al, sg * (180.0 - np.abs(al)))
+
+
 def decode_clip(out, pp, video=None, col_az_deg=None, fb_trained=True, on_trained=True, snap_log=None):
     """out: (T, 3, 5, 13) numpy (활성 함수 전), video: (T, 24, 77) 또는 None.
     pp['onscreen_front'](없으면 True): False 면 2번(o > τ 면 앞 고정)을 끈다(진단용).
@@ -30,14 +43,17 @@ def decode_clip(out, pp, video=None, col_az_deg=None, fb_trained=True, on_traine
     반환: {frame: [[class, 0, az_deg, dist_m, onscreen(0/1)], ...]}"""
     T, K, _, C = out.shape
     a = _sig(out[:, :, E_ACT]) > pp['act_thresh']                              # (T, 3, C)
-    s = np.clip(np.tanh(out[:, :, E_SIN]), -1.0, 1.0)
     front = _sig(out[:, :, E_FB]) >= 0.5 if fb_trained else np.ones_like(a)
     o = _sig(out[:, :, E_ON]) if on_trained else np.zeros(a.shape)
     tau = pp['onscreen_tau']
     if pp.get('onscreen_front', True):
         front = front | (o > tau)
-    c = np.sqrt(np.clip(1.0 - s ** 2, 0.0, 1.0))
-    th = np.degrees(np.arctan2(s, np.where(front, c, -c)))                     # (T, 3, C)
+    if pp.get('az_param', 'sin') == 'alpha':                                   # W1: 출력 = α/scale (접은 방위각, 선형)
+        th = theta_from_alpha(out[:, :, E_SIN] * pp.get('alpha_scale_deg', 20.0), front)
+    else:
+        s = np.clip(np.tanh(out[:, :, E_SIN]), -1.0, 1.0)
+        c = np.sqrt(np.clip(1.0 - s ** 2, 0.0, 1.0))
+        th = np.degrees(np.arctan2(s, np.where(front, c, -c)))                 # (T, 3, C)
     dist = np.exp(out[:, :, E_DIST])
     if pp.get('snap_enable') and video is not None and col_az_deg is not None:
         col = np.asarray(col_az_deg)                                           # (24,)

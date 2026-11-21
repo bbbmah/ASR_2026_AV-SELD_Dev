@@ -19,7 +19,7 @@ from torch.utils.data import DataLoader
 
 from .config import add_seld_path, CLIP_FRAMES
 from .model import NADModel
-from .loss import NADLoss
+from .loss import make_loss
 from .postproc import decode_clip, write_clip
 
 PP_KEYS = ('act_thresh', 'onscreen_tau', 'snap_enable', 'snap_score', 'snap_window_deg', 'merge_deg')
@@ -61,12 +61,40 @@ def modality(cfg):
 
 def postproc_params(cfg, run_dir=None):
     pp = {k: cfg[k] for k in PP_KEYS}
+    if run_dir is None and not _blank(cfg.get('postproc_from')):
+        run_dir = os.path.join(cfg['out_root'], cfg['postproc_from'])          # N2w: 기존 N2 의 postproc.json 을 그대로
     p = os.path.join(run_dir or cfg['run_dir'], 'postproc.json')
     if os.path.exists(p):
         pp.update(json.load(open(p, encoding='utf8'))['params'])
+    elif run_dir is not None and run_dir != cfg['run_dir']:
+        raise FileNotFoundError(f'postproc.json 이 없습니다: {p}')
     if cfg['stage'] == 1:
         pp['snap_enable'] = False
+    # 출력 해석 방식(후처리 값이 아니라 모델 형식): W1 은 접은 방위각 α
+    pp['az_param'] = 'alpha' if cfg.get('loss_version') == 'w1' else 'sin'
+    pp['alpha_scale_deg'] = float(cfg.get('alpha_scale_deg', 20.0))
     return pp
+
+
+def _blank(v):
+    return v is None or (isinstance(v, str) and v.strip() == '')
+
+
+class EMA:
+    """가중치 EMA. 파라미터는 decay 로 섞고, 버퍼(BN 통계, 특징 통계 등)는 그대로 복사한다."""
+    def __init__(self, model, decay):
+        import copy
+        self.decay = float(decay)
+        self.m = copy.deepcopy(model).eval()
+        for p in self.m.parameters():
+            p.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, model):
+        for e, p in zip(self.m.parameters(), model.parameters()):
+            e.lerp_(p.detach(), 1.0 - self.decay)
+        for e, b in zip(self.m.buffers(), model.buffers()):
+            e.copy_(b)
 
 
 def atomic_json(path, obj):
@@ -177,6 +205,25 @@ def make_optimizer(model, cfg):
     return opt, sch
 
 
+def log_grad_norms(terms, params, step, path, vkeep=None):
+    """W1 확인 4번: 가중치를 곱한 항별 손실의 그래디언트 노름(공유 몸통 = fuse + (E-2) 시간 Conformer 파라미터 기준).
+    학습에는 영향이 없다(그래디언트를 따로 구하고 버린다)."""
+    row = dict(step=step)
+    for k, v in terms.items():
+        if not v.requires_grad:
+            row[k] = 0.0; continue
+        g = torch.autograd.grad(v, params, retain_graph=True, allow_unused=True)
+        row[k] = math.sqrt(sum(float((x.float() ** 2).sum()) for x in g if x is not None))
+    if vkeep is not None:
+        row['video_kept'] = int(vkeep.sum())
+    new = not os.path.exists(path) or step == 0
+    with open(path, 'w' if new else 'a', newline='', encoding='utf8') as f:
+        w = csv.DictWriter(f, fieldnames=list(row))
+        if new:
+            w.writeheader()
+        w.writerow(row)
+
+
 def set_spatial_frozen(model, frozen):
     for p in model.spatial.parameters():
         p.requires_grad = not frozen
@@ -248,7 +295,13 @@ def stage_train(cfg):
         torch.save(model.feat.stats_dict(), os.path.join(cfg['run_dir'], 'feat_stats.pt'))
     frozen = cfg['stage'] == 2 and cfg['freeze_spatial']
     set_spatial_frozen(model, frozen)
-    loss_fn = NADLoss(cfg)
+    loss_fn = make_loss(cfg)
+    w1 = cfg['loss_version'] == 'w1'
+    ema = EMA(model, cfg['ema_decay']) if cfg['ema_decay'] > 0 else None
+    if w1:
+        log(f'W1 설정: 손실 w1, EMA {cfg["ema_decay"]}, 클리핑 {cfg["grad_clip"]}' +
+            (f', 영상 드롭 {cfg["video_drop"]}, 열 드롭 {cfg["col_drop"]}, (D) 노이즈 {cfg["d_noise"]}, '
+             f'onscreen 가중치 {cfg["w_on_start"]}->{cfg["w_on_end"]} ({cfg["w_on_ramp_steps"]:g}갱신)' if cfg['stage'] == 2 else ''))
     opt, sch = make_optimizer(model, cfg)
     use_scaler = cfg['amp'] and dev == 'cuda' and amp_dtype() == torch.float16
     scaler = torch.amp.GradScaler('cuda', enabled=use_scaler)
@@ -264,6 +317,10 @@ def stage_train(cfg):
             raise SystemExit(f'[중단] {last_p} 는 init_from={ck.get("init_from") or "(없음)"} 으로 학습한 체크포인트인데, '
                              f'지금 init_from={cfg["init_from"] or "(없음)"} 입니다. 이 실행 폴더를 지우거나 이름을 바꾼 뒤 다시 실행하세요.')
         model.load_state_dict(ck['model']); opt.load_state_dict(ck['opt']); sch.load_state_dict(ck['sch'])
+        if ema is not None:
+            if ck.get('ema') is None:
+                raise SystemExit(f'[중단] {last_p} 에 EMA 가중치가 없습니다(다른 설정으로 학습한 폴더). 폴더를 지우거나 이름을 바꾸세요.')
+            ema.m.load_state_dict(ck['ema'])
         if use_scaler and ck.get('scaler'):
             scaler.load_state_dict(ck['scaler'])
         start_epoch, step, best, best_epoch = ck['epoch'] + 1, ck['step'], ck['best'], ck['best_epoch']
@@ -276,9 +333,13 @@ def stage_train(cfg):
     n_epochs = math.ceil(cfg['total_steps'] / cfg['steps_per_epoch'])
     tmp_pred = os.path.join(cfg['local_root'], 'tmp', cfg['run_name'], 'pred_val')
     pp = postproc_params(cfg)
-    cols = ['epoch', 'step', 'lr', 'train_loss', 'act', 'sin', 'dist', 'fb', 'on', 'rot', 'val_loss',
+    terms = ('act', 'alpha', 'dist', 'fb', 'on', 'rot', 'w_on') if w1 else ('act', 'sin', 'dist', 'fb', 'on', 'rot')
+    cols = ['epoch', 'step', 'lr', 'train_loss', *terms, 'val_loss',
             'F_ext', 'F_basic', 'DOA_ext', 'DOA_basic', 'RDE_ext', 'OSA_ext', 'seconds']
     use_video = cfg['stage'] == 2
+    gn_p = os.path.join(cfg['run_dir'], 'grad_norms.csv')
+    shared = [p for p in list(model.fuse.parameters()) + list(model.temporal.parameters()) if p.requires_grad]
+    eval_model = ema.m if ema is not None else model
     for epoch in range(start_epoch, n_epochs):
         if step >= cfg['total_steps']:
             break
@@ -293,14 +354,21 @@ def stage_train(cfg):
                 frozen = False; set_spatial_frozen(model, False); model.spatial.train()
                 log(f'갱신 {step}: (A) 인코더 고정 해제 (lr {cfg["finetune_lr"]})')
             b = to_dev(b, dev)
+            vkeep = b.get('vkeep') if use_video else None
             with torch.autocast('cuda', dtype=amp_dtype(), enabled=cfg['amp'] and dev == 'cuda'):
-                pred = model(b['audio'], b['clap'], b.get('video') if use_video else None)
-            loss, parts = loss_fn(pred, b['labels'], b.get('dpsi'))
+                pred = model(b['audio'], b['clap'], b.get('video') if use_video else None, vkeep=vkeep)
+            loss, parts = loss_fn(pred, b['labels'], b.get('dpsi'), vkeep=vkeep, step=step)
+            if w1 and not math.isfinite(parts['total']):
+                raise SystemExit(f'[중단] 갱신 {step}: 손실이 NaN/inf 입니다 ({parts}). 원인을 고치지 않고 멈춥니다(MODEL_DEV_2.md).')
             opt.zero_grad(set_to_none=True)
+            if w1 and step < cfg['grad_norm_log_steps'] and step % 10 == 0:
+                log_grad_norms(loss_fn.last_terms, shared, step, gn_p, vkeep)
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], cfg['grad_clip'])
             scaler.step(opt); scaler.update(); sch.step()
+            if ema is not None:
+                ema.update(model)
             step += 1; nb += 1
             for k, v in parts.items():
                 sums[k] = sums.get(k, 0.0) + v
@@ -308,12 +376,12 @@ def stage_train(cfg):
                 log(f'  에폭 {epoch + 1} 갱신 {nb}/{cfg["steps_per_epoch"]} 손실 {sums["total"] / nb:.4f} ({time.time() - t0:.0f}초)')
             if step >= cfg['total_steps']:
                 break
-        val_loss, _ = predict(model, val_ds, cfg, dev, tmp_pred, pp, loss_fn)
+        val_loss, _ = predict(eval_model, val_ds, cfg, dev, tmp_pred, pp, loss_fn)      # EMA 를 켜면 EMA 가중치로 채점, 선택
         res = score(cfg, tmp_pred, val_ref)
         cur = metric(res, cfg['select_metric'])
         e, bb = res['ext'], res['basic']
         row = dict(epoch=epoch + 1, step=step, lr=sch.get_last_lr()[-1], train_loss=sums.get('total', 0) / max(1, nb),
-                   **{k: (sums[k] / nb if k in sums else None) for k in ('act', 'sin', 'dist', 'fb', 'on', 'rot')},
+                   **{k: (sums[k] / nb if k in sums else None) for k in terms},
                    val_loss=val_loss, F_ext=e['F'], F_basic=bb['F'], DOA_ext=e['DOA_err'], DOA_basic=bb['DOA_err'],
                    RDE_ext=e['rel_dist_err'], OSA_ext=e['onscreen_acc'], seconds=time.time() - t0)
         new = not os.path.exists(log_p)
@@ -327,10 +395,12 @@ def stage_train(cfg):
             f'F_ext {pct(e["F"])} F_basic {pct(bb["F"])} | DOA_ext {e["DOA_err"]} | {row["seconds"]:.0f}초')
         if cur >= best:
             best, best_epoch = cur, epoch
-            torch.save(dict(model=model.state_dict(), epoch=epoch, step=step, best=best, val_scores=res), best_p + '.tmp')
+            torch.save(dict(model=eval_model.state_dict(), epoch=epoch, step=step, best=best, val_scores=res,
+                            ema=ema is not None), best_p + '.tmp')
             os.replace(best_p + '.tmp', best_p)
         torch.save(dict(model=model.state_dict(), opt=opt.state_dict(), sch=sch.state_dict(), scaler=scaler.state_dict() if use_scaler else None,
-                        epoch=epoch, step=step, best=best, best_epoch=best_epoch, init_from=cfg['init_from'] or ''), last_p + '.tmp')
+                        epoch=epoch, step=step, best=best, best_epoch=best_epoch, init_from=cfg['init_from'] or '',
+                        ema=ema.m.state_dict() if ema is not None else None), last_p + '.tmp')
         os.replace(last_p + '.tmp', last_p)
     atomic_json(os.path.join(cfg['run_dir'], 'train_summary.json'),
                 dict(run=cfg['run_name'], best_epoch=best_epoch + 1, best_value=best, select_metric=cfg['select_metric'], total_steps=step))
@@ -338,10 +408,20 @@ def stage_train(cfg):
 
 
 # ====================================================================== eval / tune / predict / score
+def ckpt_suffix(cfg):
+    return '_last' if cfg.get('eval_ckpt', 'best') == 'last' else ''
+
+
 def load_best(cfg, dev, log):
+    """eval_ckpt=best: best_model.pth (EMA 를 켠 실행이면 EMA 가중치). eval_ckpt=last: last.pth 의 EMA(없으면 일반) 가중치."""
     model = build_model(cfg, dev, log)
-    ck = torch.load(os.path.join(cfg['run_dir'], 'best_model.pth'), map_location=dev, weights_only=False)
-    model.load_state_dict(ck['model'])
+    if cfg.get('eval_ckpt', 'best') == 'last':
+        ck = torch.load(os.path.join(cfg['run_dir'], 'last.pth'), map_location=dev, weights_only=False)
+        model.load_state_dict(ck['ema'] if ck.get('ema') is not None else ck['model'])
+        ck = dict(epoch=ck['epoch'], step=ck['step'])
+    else:
+        ck = torch.load(os.path.join(cfg['run_dir'], 'best_model.pth'), map_location=dev, weights_only=False)
+        model.load_state_dict(ck['model'])
     return model, ck
 
 
@@ -351,11 +431,12 @@ def stage_eval(cfg, split='val'):
     dev = device(); log = Logger(os.path.join(cfg['run_dir'], 'train_out.log'))
     model, ck = load_best(cfg, dev, log)
     pp = postproc_params(cfg)
-    out = os.path.join(cfg['run_dir'], 'pred_val')
+    sfx = ckpt_suffix(cfg)
+    out = os.path.join(cfg['run_dir'], 'pred_val' + sfx)
     predict(model, make_eval_ds(cfg, 'val', log), cfg, dev, out, pp)
     res = score(cfg, out, extract_labels(cfg, 'val', log))
-    atomic_json(os.path.join(cfg['run_dir'], 'scores_val.json'), dict(run=cfg['run_name'], best_epoch=ck['epoch'] + 1, postproc=pp, scores=res))
-    log(f'[val] {one_line(res)}  (후처리 {pp})')
+    atomic_json(os.path.join(cfg['run_dir'], f'scores_val{sfx}.json'), dict(run=cfg['run_name'], ckpt=cfg.get('eval_ckpt', 'best'), best_epoch=ck['epoch'] + 1, postproc=pp, scores=res))
+    log(f'[val{sfx}] {one_line(res)}  (후처리 {pp})')
     return res
 
 
@@ -367,6 +448,7 @@ def stage_tune_post(cfg):
     model, _ = load_best(cfg, dev, log)
     ref = extract_labels(cfg, 'val', log)
     base = {k: cfg[k] for k in PP_KEYS}
+    base.update({k: v for k, v in postproc_params(cfg).items() if k not in PP_KEYS})     # 출력 해석 방식(az_param)
     tmp = os.path.join(cfg['local_root'], 'tmp', cfg['run_name'], 'tune')
     _, kept = predict(model, make_eval_ds(cfg, 'val', log), cfg, dev, tmp, base, keep_outputs=True)
     col = np.degrees(model.vis.col_az.cpu().numpy())
@@ -395,10 +477,11 @@ def stage_predict(cfg):
     dev = device(); log = Logger(os.path.join(cfg['run_dir'], 'train_out.log'))
     model, _ = load_best(cfg, dev, log)
     pp = postproc_params(cfg)
-    out = os.path.join(cfg['run_dir'], 'pred_test')
+    sfx = ckpt_suffix(cfg)
+    out = os.path.join(cfg['run_dir'], 'pred_test' + sfx)
     ds = make_eval_ds(cfg, 'test', log, with_labels=False)
     predict(model, ds, cfg, dev, out, pp)
-    z = os.path.join(cfg['run_dir'], f'submission_{cfg["run_name"]}.zip')
+    z = os.path.join(cfg['run_dir'], f'submission_{cfg["run_name"]}{sfx}.zip')
     with zipfile.ZipFile(z, 'w', zipfile.ZIP_DEFLATED) as zf:
         for f in sorted(os.listdir(out)):
             zf.write(os.path.join(out, f), f)
@@ -409,9 +492,10 @@ def stage_score_test(cfg):
     """최종 보고용: 비공개 test 정답(private_test.zip)으로 채점한다. 모델/후처리 선택에는 쓰지 않는다."""
     from .prerender import extract_labels
     log = Logger(os.path.join(cfg['run_dir'], 'train_out.log'))
-    res = score(cfg, os.path.join(cfg['run_dir'], 'pred_test'), extract_labels(cfg, 'test', log))
-    atomic_json(os.path.join(cfg['run_dir'], 'scores_test.json'), dict(run=cfg['run_name'], postproc=postproc_params(cfg), scores=res))
-    log(f'[test] {one_line(res)}')
+    sfx = ckpt_suffix(cfg)
+    res = score(cfg, os.path.join(cfg['run_dir'], 'pred_test' + sfx), extract_labels(cfg, 'test', log))
+    atomic_json(os.path.join(cfg['run_dir'], f'scores_test{sfx}.json'), dict(run=cfg['run_name'], ckpt=cfg.get('eval_ckpt', 'best'), postproc=postproc_params(cfg), scores=res))
+    log(f'[test{sfx}] {one_line(res)}')
     return res
 
 
@@ -432,6 +516,8 @@ def oracle_check(cfg, n_clips=None, log=print):
             shutil.rmtree(d)
         os.makedirs(d)
     pp = {k: cfg[k] for k in PP_KEYS}; pp['snap_enable'] = False
+    pp.update({k: v for k, v in postproc_params(cfg).items() if k not in PP_KEYS})   # W1 이면 α 형식
+    alpha = pp['az_param'] == 'alpha'
     for f in files:
         shutil.copy(os.path.join(ref, f), tmp_ref)
         ev = pd.read_csv(os.path.join(ref, f))[['frame', 'class', 'source', 'azimuth', 'distance', 'onscreen']].values.astype(np.int32)
@@ -444,12 +530,15 @@ def oracle_check(cfg, n_clips=None, log=print):
                     m = m & (y[:, 1, 0] < 0.5) & (y[:, 3, 0] < 0.5)
                 tt, cc = np.nonzero(m)
                 out[tt, k, E_ACT, cc] = 10.0
-                out[tt, k, E_SIN, cc] = np.arctanh(np.clip(y[tt, src, 2, cc], -0.999999, 0.999999))
+                if alpha:
+                    out[tt, k, E_SIN, cc] = np.degrees(np.arcsin(np.clip(y[tt, src, 2, cc], -1, 1))) / pp['alpha_scale_deg']
+                else:
+                    out[tt, k, E_SIN, cc] = np.arctanh(np.clip(y[tt, src, 2, cc], -0.999999, 0.999999))
                 out[tt, k, E_FB, cc] = np.where(y[tt, src, 1, cc] > 0, 10.0, -10.0)
                 out[tt, k, E_DIST, cc] = np.log(np.maximum(y[tt, src, 3, cc], 0.05))
                 out[tt, k, E_ON, cc] = np.where(y[tt, src, 4, cc] > 0.5, 10.0, -10.0)
         write_clip(decode_clip(out, pp, fb_trained=True, on_trained=True), tmp_pred, f[:-4])
     from score import score_dirs, one_line as ol
     res = score_dirs(tmp_pred, tmp_ref, CLIP_FRAMES, 'audio_visual', None, exclude_absent_classes=True)
-    log(f'[정답 -> 출력 형식 -> csv -> 채점] 클립 {len(files)}개: {ol(res)}')
+    log(f'[정답 -> 출력 형식({pp["az_param"]}) -> csv -> 채점] 클립 {len(files)}개: {ol(res)}')
     return res

@@ -38,6 +38,29 @@ loss_fb:                       # 앞/뒤 손실 사용 (비우면 프리셋 값)
 loss_onscreen:                 # onscreen 손실 사용 (비우면 프리셋 값)
 loss_rot:                      # 회전 손실 사용 (비우면 프리셋 값)
 
+# ---------------- W1 설정 (MODEL_DEV_2.md). 프리셋 N1w, N1w-rb, N2w 에서만 쓴다 ----------------
+loss_version: v0               # v0 = 기존(N1-pre, N1-otf, N2) | w1. 프리셋이 정한다
+ema_decay: 0.0                 # 가중치 EMA. 0 이면 끔. W1 프리셋 = 0.999 (평가, 모델 선택은 EMA 가중치)
+w_act: 1.0                     # ① BCE(a, â), 전체 칸 평균
+w_alpha: 1.0                   # ② Huber(δ=1)((α̂-α)/20°), 활성 칸 평균
+alpha_scale_deg: 20.0
+w_fb: 2.0                      # ③ |cosθ|·BCE(f_ε, f̂), 활성 칸 평균 (2단계)
+fb_smooth: 0.1                 #    라벨 스무딩 ε (앞 0.95, 뒤 0.05)
+w_dist: 0.3                    # ④ |ln d - ℓ̂| / ln2, 활성 칸 평균
+w_on_start: 0.1                # ⑤ BCE(o_τ, ô), 활성 칸 평균 (2단계). 처음 w_on_ramp_steps 동안 start -> end 선형
+w_on_end: 0.5
+w_on_ramp_steps: 5000
+on_soft_tau: 5.0               #    소프트 라벨 o_τ 의 τ(도)
+w_psi: 0.5                     # ⑥ ((Δψ-Δψ̂)/1.8°)², 학습 때만 (2단계)
+psi_scale_deg: 1.8
+video_drop: 0.2                # 2단계 학습: 샘플마다 이 확률로 영상 특징 전체를 0 (그 샘플은 ③⑤⑥ 제외)
+col_drop: 0.1                  # 2단계 학습: (샘플, 프레임, 열)마다 이 확률로 열 특징을 0 (열 방위각 입력은 유지)
+d_noise: 0.05                  # 2단계 학습: (D) 입력(표준화한 열 특징)에 표준편차 × 이 값의 가우시안 노이즈
+grad_norm_log_steps: 200       # 학습 처음 이 갱신 수 동안 10번마다 항별 그래디언트 노름 기록 (grad_norms.csv)
+otf_room_balance: false        # 즉석 변환 녹음 선택: 방별 같은 확률, 방 안에서는 길이 비례 (프리셋 N1w-rb)
+postproc_from:                 # 비우지 않으면 이 실행 이름의 postproc.json 을 쓴다 (N2w 는 기존 N2 의 것)
+eval_ckpt: best                # best | last. last 면 last.pth 의 EMA 가중치로 eval/predict/score_test (결과 파일 이름에 _last)
+
 # ---------------- 모델 ----------------
 d_model: 256
 n_heads: 8

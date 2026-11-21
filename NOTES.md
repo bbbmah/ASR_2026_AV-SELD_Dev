@@ -12,7 +12,8 @@
 | `nad/semantic.py`, `nad/visual.py` | (B) CLAP 캐시, (C) OWL-ViT 열 특징 캐시 |
 | `nad/model.py`, `nad/loss.py`, `nad/postproc.py` | 모델 (A~F), 새 ADPIT 손실, 추론 후처리 |
 | `nad/data.py`, `nad/runner.py` | 데이터셋, 학습(이어 하기)/평가/예측/채점 |
-| `colab_diag.ipynb`, `diag_run.py`, `nad/diag.py` | 1차 결과 진단(DIGNOSIS_1.md, 추론만) -> `diag/DIAG_01/` |
+| `colab_diag.ipynb`, `diag_run.py`, `nad/diag.py` | 1차 결과 진단(DIGNOSIS_1.md, 추론만) -> `diag/DIAG_01/` (W1: `--n2 N2w --diag W1_N2w`, 비교 쌍 `--n1a/--n1b/--n1_out`, 노트북 7절) |
+| `nad/w1check.py` | W1 구현 전 확인 2, 3번 (`nad_run.py w1_check --preset N2w`) |
 
 프리셋: `N1-pre`(1단계, main20 train+S1), `N1-otf`(1단계, 즉석 변환), `N2`(2단계 AV, `init_from`=1단계 실행 이름).
 
@@ -34,6 +35,18 @@
 - 정답 -> 새 출력 형식 -> 후처리 -> csv -> 베이스라인 채점: val 123클립 F_ext 99.3%, DOA 0.05°.
 - 작은 설정(배치 2, 갱신 몇 번, 가짜 CLAP/OWL 캐시)으로 N1-otf 학습 -> 이어 하기 -> eval, N2 학습(1단계 불러오기, 반전 영상, 중간 고정 해제) -> tune_post -> eval 이 끝까지 돈다.
 - 확인 못 한 것: 실제 CLAP/OWL-ViT 실행(로컬에 transformers 없음), GPU 속도와 메모리, 전체 학습. OWL-ViT 전처리 방식은 `owl_check` 가 코랩에서 processor 설정을 읽어 출력한다.
+
+## W1 (MODEL_DEV_2.md, 2026-11-21) — 프리셋 `N1w`, `N2w`, `N1w-rb` (`loss_version: w1`). 기존 프리셋 동작은 그대로
+- 접은 각도 출력은 기존 sinθ 자리 값 × 20° = α̂ 이다(선형, 손실은 Huber(출력 − α/20°)). 읽을 때 ±90°로 자르고, 앞/뒤 판정은 기존 그대로 f ≥ 0.5.
+- 소프트 onscreen: 생성기 `dsgen.to_cam` 카메라 좌표에서 투영각 h=atan2(|y|,x), v=atan2(|z|,x)로 σ((50°−h)/τ)·σ((33.84°−v)/τ)·1[x>0].
+  (생성기 판정 `x>0, |y|≤x·tan50°, |z|≤x·tanV` 와 같은 경계, |θ|<90° 대신 x>0). 학습 클립 `meta/*_ext.csv` 로 `cache/meta/train_s*_onsoft_tau5.pkl` 에 미리 계산.
+- 영상 드롭아웃은 표준화한 영상 특징을 0 으로 한다(DIAG_01 '영상 0'과 같음). 열 드롭아웃은 (샘플, 프레임, 열)마다. (D) 노이즈 σ = 0.05(표준화 특징 기준), 드롭한 샘플에는 안 넣음.
+- val 손실(기록용)은 하드 onscreen 라벨로 계산한다(val 에는 소프트 캐시를 만들지 않음).
+- EMA 는 파라미터만 섞고 버퍼(BN 통계 등)는 복사. `best_model.pth` 의 model = EMA 가중치, `last.pth` 에 일반+EMA 둘 다. `eval_ckpt=last` 는 결과 파일에 `_last`.
+- 그래디언트 노름(`grad_norms.csv`)은 가중치를 곱한 항별 값, 공유 몸통 = fuse + (E-2) 시간 Conformer. ⑥(Δψ)은 (D)만 지나므로 이 기준에서 0 이다.
+- N2w 후처리는 `postproc_from=nad_N2_S01_s1` (기존 postproc.json, 조합 a). W1 은 `tune_post` 를 돌리지 않는다.
+- 로컬 확인(2026-11-21): 소프트 라벨 0.5 이진화 = 하드 라벨 S0 99.564%, S1 99.551% (234만 행). θ→(α,f)→θ 최대 차이 1e-13°(반전 포함).
+  α 형식 오라클 val F_ext 99.3%. 정답 입력 손실 ②④⑥ = 0, ③ 0.12688 = 하한, ⑤ 0.11385 = 하한. 무작위 입력으로 N1w/N2w/N2 순전파·역전파·EMA·복원 동작.
 
 ## 사전학습 가중치 (출처)
 - LAION-CLAP: `laion/clap-htsat-unfused` (HuggingFace)
