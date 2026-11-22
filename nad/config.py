@@ -23,10 +23,15 @@ PRESETS = {
     'N1w':    dict(stage=1, data_source='onthefly', loss_fb=False, loss_onscreen=False, loss_rot=False, select_metric='F_basic', **_W1),
     'N1w-rb': dict(stage=1, data_source='onthefly', loss_fb=False, loss_onscreen=False, loss_rot=False, select_metric='F_basic',
                    otf_room_balance=True, **_W1),
+    # ① 활성 항 세기만 바꾼 N1w (전체 칸 평균 정규화는 그대로, ①에 w_act 를 곱함. 순열 선택의 가중 합에도 같은 w_act)
+    'N1w-a5':  dict(stage=1, data_source='onthefly', loss_fb=False, loss_onscreen=False, loss_rot=False, select_metric='F_basic',
+                    w_act=5.0, **_W1),
+    'N1w-a10': dict(stage=1, data_source='onthefly', loss_fb=False, loss_onscreen=False, loss_rot=False, select_metric='F_basic',
+                    w_act=10.0, **_W1),
     'N2w':    dict(stage=2, data_source='prerender', loss_fb=True, loss_onscreen=True, loss_rot=True, select_metric='F_ext', **_W1),
 }
 PRESET_KEYS = ('data_source', 'loss_fb', 'loss_onscreen', 'loss_rot', 'select_metric')
-FORCED_KEYS = ('loss_version', 'ema_decay', 'grad_clip', 'otf_room_balance')    # 프리셋에 있으면 --set 으로 주지 않은 한 프리셋 값
+FORCED_KEYS = ('loss_version', 'ema_decay', 'grad_clip', 'otf_room_balance', 'w_act')    # 프리셋에 있으면 --set 으로 주지 않은 한 프리셋 값
 
 CLIP_FRAMES = 200
 NB_CLASSES = 13
