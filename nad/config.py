@@ -28,6 +28,9 @@ PRESETS = {
                     w_act=5.0, **_W1),
     'N1w-a10': dict(stage=1, data_source='onthefly', loss_fb=False, loss_onscreen=False, loss_rot=False, select_metric='F_basic',
                     w_act=10.0, **_W1),
+    # N2w 와 w_act 만 다른 2단계 (init_from = nad_N1w-a5_otf_s1, 노트북 13절)
+    'N2w-a5':  dict(stage=2, data_source='prerender', loss_fb=True, loss_onscreen=True, loss_rot=True, select_metric='F_ext',
+                    w_act=5.0, **_W1),
     'N2w':    dict(stage=2, data_source='prerender', loss_fb=True, loss_onscreen=True, loss_rot=True, select_metric='F_ext', **_W1),
 }
 PRESET_KEYS = ('data_source', 'loss_fb', 'loss_onscreen', 'loss_rot', 'select_metric')

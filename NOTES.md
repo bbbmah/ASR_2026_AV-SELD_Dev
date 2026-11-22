@@ -13,6 +13,7 @@
 | `nad/model.py`, `nad/loss.py`, `nad/postproc.py` | 모델 (A~F), 새 ADPIT 손실, 추론 후처리 |
 | `nad/data.py`, `nad/runner.py` | 데이터셋, 학습(이어 하기)/평가/예측/채점 |
 | `colab_diag.ipynb`, `diag_run.py`, `nad/diag.py` | 1차 결과 진단(DIGNOSIS_1.md, 추론만) -> `diag/DIAG_01/` (W1: `--n2 N2w --diag W1_N2w`, 비교 쌍 `--n1a/--n1b/--n1_out`, 노트북 7절) |
+| `err_run.py`, `nad/errdiag.py` | 오라클 교체(앞/뒤, onscreen, 각도, 거리)와 오류 분해. 기존 예측 csv 만 읽음 -> `diag/ERR_01/` (colab_diag 8절) |
 | `nad/w1check.py` | W1 구현 전 확인 2, 3번 (`nad_run.py w1_check --preset N2w`) |
 
 프리셋: `N1-pre`(1단계, main20 train+S1), `N1-otf`(1단계, 즉석 변환), `N2`(2단계 AV, `init_from`=1단계 실행 이름).
@@ -51,6 +52,8 @@
 ## ① 세기 실험 (2026-11-21) — 프리셋 `N1w-a5`, `N1w-a10` (노트북 12절, 보고 `RESULT_03.md`)
 - N1w 와 `w_act`(5, 10)만 다르다(프리셋 강제 값). ① 정규화(전체 칸 평균)는 그대로이고, 순열 선택 가중 합에도 같은 w_act 가 들어간다(W1 손실 식 그대로).
 - `grad_norms.csv` 의 act 는 w_act 를 곱한 값이다. 노트북 12번 설정 칸이 학습 전에 실제 N1w `config_used.yaml` 과 비교해 w_act 외 차이가 없음을 확인한다.
+
+- 2단계 `N2w-a5` (노트북 13절): N2w 와 `init_from`(= `nad_N1w-a5_otf_s1`), `w_act`=5 만 다르다. 후처리는 N2 postproc.json, 진단은 `diag/W1_N2w-a5/`.
 
 ## 사전학습 가중치 (출처)
 - LAION-CLAP: `laion/clap-htsat-unfused` (HuggingFace)
